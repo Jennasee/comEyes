@@ -1,661 +1,875 @@
+import sys
+import time
+import random
+import datetime
 import cv2
 import numpy as np
-import tkinter as tk
-from tkinter import ttk  # Import themed widgets
-import tkinter.messagebox as messagebox
-from PIL import Image, ImageTk
-import time
-from mss import mss
-import torch
-import sys
-import traceback
+import mss
+import psutil # For CPU/Memory info
+import pyautogui # For screen info
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt, QTimer, QPointF, QThread, Signal, Slot
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QFontDatabase
+from PySide6.QtWidgets import QApplication, QWidget, QMainWindow, QVBoxLayout, QGridLayout, QComboBox, QSpinBox, QDoubleSpinBox, QPushButton, QLabel, QTextEdit
+import logging
+from ultralytics import YOLO
 import supervision as sv
+import torch
+import os
 
-class VisionSimulator:
-    def __init__(self, root):
-        """
-        Initializes the Vision Simulator application.
+# --- Configurations ---
+UPDATE_INTERVAL_MS = 500  # Interval for updating HUD text elements
+SCANLINE_SPEED_MS = 15    # Speed of the scanline effect
+DETECTION_INTERVAL_MS = 150 # Default interval for running detection
+SYSTEM_INFO_INTERVAL_MS = 1000 # Interval for updating system info (CPU, RAM, etc.)
+CONFIDENCE_THRESHOLD = 0.4 # Default confidence threshold for detection
+NMS_THRESHOLD = 0.3        # Default Non-Maximum Suppression threshold
+FONT_NAME = "Press Start 2P" # Preferred retro font
+FALLBACK_FONT = "Monospace" # Fallback font if preferred is not found
+FONT_SIZE_SMALL = 10
+FONT_SIZE_MEDIUM = 12
+RED_COLOR = QColor(255, 0, 0) # Primary color for UI elements
+TEXT_COLOR = QColor(255, 0, 0) # Color for text
 
-        Args:
-            root (tk.Tk): The main Tkinter window.
-        """
-        self.root = root
-        self.root.title("Vision Simulator - Screen Capture")
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.geometry("1000x800") # Set a default window size
+# --- Helper Functions ---
+def random_hex(length):
+    """Generate a random hexadecimal string of specified length."""
+    return ''.join(random.choice('ABCDEF0123456789') for _ in range(length))
 
-        # --- Style ---
-        style = ttk.Style(self.root)
-        style.theme_use('clam') # Use a modern theme ('clam', 'alt', 'default', 'classic')
+def get_gpu_info():
+    """Fetches GPU name and memory usage if CUDA is available."""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        total_mem, free_mem = torch.cuda.mem_get_info(0)
+        used_mem = total_mem - free_mem
+        mem_usage = f"{(used_mem / (1024**3)):.1f}/{(total_mem / (1024**3)):.1f} GB"
+        return gpu_name, mem_usage
+    else:
+        return "N/A (CUDA not available)", "N/A"
 
-        # --- Screen Capture Initialization ---
+# --- Custom Logging Handler for QTextEdit ---
+class QTextEditLogger(logging.Handler):
+    """Sends logging records to a QTextEdit widget."""
+    def __init__(self, text_edit):
+        super().__init__()
+        self.text_edit = text_edit
+        self.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+    def emit(self, record):
+        msg = self.format(record)
+        # Use invokeMethod to ensure thread safety when updating GUI from different threads
+        QtCore.QMetaObject.invokeMethod(
+            self.text_edit,
+            "append",
+            QtCore.Qt.QueuedConnection,
+            QtCore.Q_ARG(str, msg)
+        )
+
+# --- Screen Capture Thread ---
+class ScreenCaptureThread(QThread):
+    """Captures screen frames periodically in a separate thread."""
+    frame_ready = Signal(np.ndarray)
+    status_update = Signal(str)
+
+    def __init__(self, monitor_spec):
+        super().__init__()
+        self.monitor_spec = monitor_spec
+        self.running = False
+        self.sct = None
+        self._detection_interval_ms = DETECTION_INTERVAL_MS # Use internal variable
+
+    def run(self):
+        self.running = True
         try:
-            self.sct = mss()
-            # Get primary monitor dimensions dynamically
-            monitor_info = self.sct.monitors[1] # Index 1 is usually the primary monitor
-            self.monitor = {
-                "left": monitor_info["left"],
-                "top": monitor_info["top"],
-                "width": monitor_info["width"],
-                "height": monitor_info["height"]
-            }
+            self.sct = mss.mss()
+            logger.info(f"Screen capture started for monitor: {self.monitor_spec}")
+            while self.running:
+                start_time = time.time()
+                try:
+                    sct_img = self.sct.grab(self.monitor_spec)
+                    frame = np.array(sct_img)
+                    # Convert from BGRA to BGR (OpenCV standard)
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    self.frame_ready.emit(frame_bgr)
+                except mss.ScreenShotError as e:
+                    self.status_update.emit(f"Screen capture error: {e}")
+                    logger.error(f"Screen capture error: {e}")
+                    time.sleep(1) # Wait before retrying
+                except Exception as e:
+                    self.status_update.emit(f"Unexpected screen capture error: {e}")
+                    logger.error(f"Unexpected screen capture error: {e}", exc_info=True)
+                    time.sleep(1)
+
+                # Calculate sleep time to maintain the desired interval
+                elapsed = time.time() - start_time
+                sleep_time = max(0, (self._detection_interval_ms / 1000.0) - elapsed)
+                time.sleep(sleep_time)
+        finally:
+            if self.sct:
+                self.sct.close()
+            logger.info("Screen capture stopped.")
+
+    def stop(self):
+        """Signals the thread to stop."""
+        self.running = False
+        logger.info("Stopping screen capture thread...")
+
+    @Slot(int)
+    def update_detection_interval(self, interval):
+        """Updates the interval between frame captures."""
+        logger.info(f"Updating capture interval to {interval} ms")
+        self._detection_interval_ms = interval
+
+# --- Detection Thread with Ultralytics YOLO ---
+class DetectionThread(QThread):
+    """Runs object detection on frames in a separate thread."""
+    detections_ready = Signal(list) # Emits list of (label, confidence, bbox)
+    status_update = Signal(str)     # Emits status messages
+
+    def __init__(self, model_name):
+        super().__init__()
+        self.model_name = model_name
+        self.model = None
+        self.input_frame = None
+        self.running = False
+        self.frame_width = 0
+        self.frame_height = 0
+        self._confidence_threshold = CONFIDENCE_THRESHOLD # Internal variable
+        self._nms_threshold = NMS_THRESHOLD           # Internal variable
+        self._frame_lock = QtCore.QMutex() # To safely access input_frame
+
+    def load_model(self):
+        """Loads the specified YOLO model."""
+        self.status_update.emit(f"Loading model {self.model_name}...")
+        try:
+            self.model = YOLO(self.model_name)
+            # Attempt to use GPU if available
+            if torch.cuda.is_available():
+                self.model.to('cuda')
+                device = 'GPU (CUDA)'
+            else:
+                self.model.to('cpu')
+                device = 'CPU'
+            logger.info(f"Model '{self.model_name}' loaded successfully on {device}.")
+            self.status_update.emit(f"Model '{self.model_name}' loaded on {device}.")
+            return True
         except Exception as e:
-            messagebox.showerror("Screen Capture Error", f"Failed to initialize screen capture: {e}")
-            sys.exit(1)
+            error_msg = f"Failed to load model '{self.model_name}': {e}"
+            logger.error(error_msg, exc_info=True)
+            self.status_update.emit(error_msg)
+            return False
 
-        # --- Hardware Checks ---
-        self.available_gpus = []
-        if torch.cuda.is_available():
-            self.available_gpus = [f"GPU {i}: {torch.cuda.get_device_name(i)}" for i in range(torch.cuda.device_count())]
-        if not self.available_gpus:
-            messagebox.showwarning("Hardware Warning", "No CUDA-enabled GPU found. Processing will run on CPU (if supported by models) or fail.")
-            self.device = torch.device("cpu") # Fallback to CPU
+    @Slot(np.ndarray)
+    def set_frame(self, frame):
+        """Receives a new frame for processing."""
+        with QtCore.QMutexLocker(self._frame_lock):
+            self.input_frame = frame
+            # Store frame dimensions once
+            if self.frame_width == 0 or self.frame_height == 0:
+                self.frame_height, self.frame_width = frame.shape[:2]
+                logger.info(f"Received first frame with dimensions: {self.frame_width}x{self.frame_height}")
+
+    def run(self):
+        """Main loop for the detection thread."""
+        if not self.load_model():
+            self.running = False # Stop if model loading failed
+            return
+
+        self.running = True
+        logger.info("Detection thread started.")
+        while self.running:
+            frame_to_process = None
+            # Safely get the latest frame
+            with QtCore.QMutexLocker(self._frame_lock):
+                if self.input_frame is not None:
+                    frame_to_process = self.input_frame.copy()
+                    self.input_frame = None # Consume the frame
+
+            if frame_to_process is not None and self.model is not None:
+                start_time = time.time()
+                try:
+                    # Perform inference
+                    results = self.model(
+                        frame_to_process,
+                        conf=self._confidence_threshold,
+                        iou=self._nms_threshold,
+                        verbose=False # Reduce console output from YOLO
+                    )
+
+                    detections = []
+                    # Process results
+                    for result in results:
+                        boxes = result.boxes
+                        for box in boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            confidence = box.conf[0].cpu().numpy()
+                            class_id = int(box.cls[0].cpu().numpy())
+                            label = self.model.names.get(class_id, f"ID:{class_id}") # Use get for safety
+                            detections.append((label, float(confidence), (int(x1), int(y1), int(x2), int(y2))))
+
+                    self.detections_ready.emit(detections)
+                    elapsed = time.time() - start_time
+                    # logger.debug(f"Detection took {elapsed:.3f}s, found {len(detections)} objects.")
+
+                except Exception as e:
+                    error_msg = f"Detection error: {e}"
+                    logger.error(error_msg, exc_info=True)
+                    self.status_update.emit(error_msg)
+                    # Avoid busy-waiting on error
+                    self.msleep(50)
+            else:
+                # Wait briefly if no frame is available
+                self.msleep(20)
+
+        logger.info("Detection thread stopped.")
+
+    def stop(self):
+        """Signals the thread to stop."""
+        self.running = False
+        logger.info("Stopping detection thread...")
+
+    @Slot(float)
+    def update_confidence_threshold(self, threshold):
+        """Updates the confidence threshold for detection."""
+        logger.info(f"Updating confidence threshold to {threshold:.2f}")
+        self._confidence_threshold = threshold
+
+    @Slot(float)
+    def update_nms_threshold(self, threshold):
+        """Updates the NMS threshold."""
+        logger.info(f"Updating NMS threshold to {threshold:.2f}")
+        self._nms_threshold = threshold
+
+# --- Terminator Overlay Widget ---
+class TerminatorOverlay(QWidget):
+    """The main overlay window displaying HUD elements."""
+    def __init__(self, monitor_spec):
+        super().__init__()
+        self.monitor_spec = monitor_spec
+        self.scanline_y = 0
+        self.flicker_on = True
+        self.power_level = 99.9 # Starting power level
+        self.current_detections = []
+        self.target_position = None # Current target screen coordinates (x, y)
+        self.tracking_status = "SCANNING" # Current tracking status
+
+        # Center crosshair initially
+        self.crosshair_position = QPointF(monitor_spec['width'] / 2, monitor_spec['height'] / 2)
+
+        # --- Setup Window ---
+        self.setWindowFlags(
+            Qt.WindowStaysOnTopHint | # Keep on top
+            Qt.FramelessWindowHint | # No title bar or borders
+            Qt.Tool |                # Prevent appearing in taskbar
+            Qt.WindowTransparentForInput # Allow clicks to pass through
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground) # Make background transparent
+        self.setGeometry(
+            monitor_spec['left'], monitor_spec['top'],
+            monitor_spec['width'], monitor_spec['height']
+        )
+
+        # --- Load Font ---
+        font_db = QFontDatabase()
+        if FONT_NAME in font_db.families():
+            self.font_small = QFont(FONT_NAME, FONT_SIZE_SMALL)
+            self.font_medium = QFont(FONT_NAME, FONT_SIZE_MEDIUM)
+            logger.info(f"Using font: {FONT_NAME}")
         else:
-            self.device = None # Will be set based on user selection
+            logger.warning(f"Font '{FONT_NAME}' not found. Using fallback '{FALLBACK_FONT}'.")
+            self.font_small = QFont(FALLBACK_FONT, FONT_SIZE_SMALL)
+            self.font_medium = QFont(FALLBACK_FONT, FONT_SIZE_MEDIUM)
 
-        self.cuda_available = cv2.cuda.getCudaEnabledDeviceCount() > 0
-        if not self.cuda_available:
-             messagebox.showwarning("OpenCV Warning", "OpenCV was not built with CUDA support. Optical flow might be slower (CPU).")
+        # --- Timers ---
+        self.scanline_timer = QTimer(self)
+        self.scanline_timer.timeout.connect(self.update_scanline)
+        self.scanline_timer.start(SCANLINE_SPEED_MS)
 
-        # --- Model Initialization (Deferred) ---
-        self.yolo_model = None
-        self.depth_model = None
-        self.depth_transform = None
+        self.hud_update_timer = QTimer(self)
+        self.hud_update_timer.timeout.connect(self.update_hud_elements)
+        self.hud_update_timer.start(UPDATE_INTERVAL_MS)
 
-        # --- Processing Variables ---
-        self.prev_frame_gray_cpu = None
-        self.prev_frame_gray_gpu = None
-        self.gpu_flow_calculator = None
-        self.fps_last_time = time.time()
-        self.fps_counter = 0
-        self.optical_flow_hsv = np.zeros((self.monitor["height"], self.monitor["width"], 3), dtype=np.uint8)
-        self.frame_count = 0
-        self.last_detections = None
-        self.last_depth_colormap = None
-        self.is_running = False
-        self.update_id = None
+        self.crosshair_timer = QTimer(self)
+        self.crosshair_timer.timeout.connect(self.update_crosshair)
+        self.crosshair_timer.start(16) # Update crosshair smoothly (~60 FPS)
 
-        # --- GUI Creation ---
-        self.create_gui()
+        logger.info("Terminator overlay initialized.")
 
-    def create_gui(self):
-        """Sets up the Tkinter GUI with themed widgets and grid layout."""
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
+    def update_scanline(self):
+        """Moves the scanline down the screen."""
+        self.scanline_y = (self.scanline_y + 5) % self.height()
+        self.flicker_on = not self.flicker_on # Toggle flicker effect
+        self.update() # Request repaint
 
-        # Configure grid columns for responsiveness
-        main_frame.columnconfigure(0, weight=3) # Video display area
-        main_frame.columnconfigure(1, weight=1) # Controls area
-        main_frame.rowconfigure(0, weight=1)    # Make video row expandable
+    def update_hud_elements(self):
+        """Updates dynamic HUD elements like power level."""
+        # Simulate power drain
+        self.power_level = max(0.0, self.power_level - random.uniform(0.01, 0.05))
+        self.update() # Request repaint
 
-        # --- Video Display Area ---
-        video_frame = ttk.LabelFrame(main_frame, text="Live Feed", padding="5")
-        video_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        video_frame.rowconfigure(0, weight=1)
-        video_frame.columnconfigure(0, weight=1)
+    @Slot(list)
+    def update_detections(self, detections):
+        """Processes new detections and updates the target."""
+        self.current_detections = detections # Store for drawing boxes
 
-        self.video_label = ttk.Label(video_frame, text="Select settings and click Start", anchor=tk.CENTER)
-        self.video_label.grid(row=0, column=0, sticky="nsew")
+        if not detections:
+            self.target_position = None
+            self.tracking_status = "SCANNING"
+            # logger.debug("No detections, target lost.")
+            return # Exit if no detections
 
-        # --- Controls Area ---
-        controls_frame = ttk.Frame(main_frame, padding="5")
-        controls_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        # Find the detection with the highest confidence
+        best_detection = max(detections, key=lambda det: det[1])
+        label, confidence, (x1, y1, x2, y2) = best_detection
 
-        # --- Hardware Selection ---
-        hw_frame = ttk.LabelFrame(controls_frame, text="Hardware", padding="10")
-        hw_frame.pack(fill=tk.X, pady=(0, 10))
-        hw_frame.columnconfigure(1, weight=1) # Make combobox expand
+        # Calculate the center of the best detection's bounding box
+        target_center_x = (x1 + x2) / 2
+        target_center_y = (y1 + y2) / 2
+        self.target_position = (target_center_x, target_center_y)
+        self.tracking_status = f"TRACKING: {label.upper()} ({confidence:.1%})"
+        # logger.debug(f"Tracking target: {label} at ({target_center_x:.0f}, {target_center_y:.0f})")
 
-        ttk.Label(hw_frame, text="Processing Device:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.gpu_var = tk.StringVar()
-        gpu_options = self.available_gpus if self.available_gpus else ["CPU (No CUDA GPU found)"]
-        self.gpu_dropdown = ttk.Combobox(hw_frame, textvariable=self.gpu_var, values=gpu_options, state="readonly")
-        if self.available_gpus:
-            self.gpu_var.set(gpu_options[0])
-        else:
-            self.gpu_var.set(gpu_options[0])
-            self.gpu_dropdown.config(state="disabled")
-        self.gpu_dropdown.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.update() # Request repaint
 
-        # --- Model Selection ---
-        model_frame = ttk.LabelFrame(controls_frame, text="Models", padding="10")
-        model_frame.pack(fill=tk.X, pady=(0, 10))
-        model_frame.columnconfigure(1, weight=1) # Make comboboxes expand
+    def update_crosshair(self):
+        """Moves the crosshair towards the target position."""
+        if self.target_position:
+            target_x, target_y = self.target_position
+            current_x = self.crosshair_position.x()
+            current_y = self.crosshair_position.y()
 
-        # Object Detection
-        ttk.Label(model_frame, text="Object Detection:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.obj_model_var = tk.StringVar(value="yolov5s")
-        self.obj_model_dropdown = ttk.Combobox(model_frame, textvariable=self.obj_model_var,
-                                               values=["yolov5n", "yolov5s", "yolov5m", "yolov8n", "yolov8s"],
-                                               state="readonly")
-        self.obj_model_dropdown.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+            # Move crosshair smoothly towards the target
+            speed = 0.15 # Adjust for desired speed (0.0 to 1.0)
+            dx = (target_x - current_x) * speed
+            dy = (target_y - current_y) * speed
 
-        # Depth Estimation
-        ttk.Label(model_frame, text="Depth Estimation:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-        self.depth_model_var = tk.StringVar(value="MiDaS_small") # Default to smaller model
-        self.depth_model_dropdown = ttk.Combobox(model_frame, textvariable=self.depth_model_var,
-                                                 values=["MiDaS_small", "DPT_Hybrid", "DPT_Large"],
-                                                 state="readonly")
-        self.depth_model_dropdown.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+            # Update crosshair position
+            self.crosshair_position.setX(current_x + dx)
+            self.crosshair_position.setY(current_y + dy)
 
-        # --- Processing Settings ---
-        settings_frame = ttk.LabelFrame(controls_frame, text="Processing Settings", padding="10")
-        settings_frame.pack(fill=tk.X, pady=(0, 10))
-        settings_frame.columnconfigure(1, weight=1) # Make scales expand
+            # Small optimization: only repaint if position changed significantly
+            if abs(dx) > 0.1 or abs(dy) > 0.1:
+                self.update() # Request repaint
+        # No need to update if no target
 
-        # Frame Skip
-        ttk.Label(settings_frame, text="Frame Skip:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.skip_var = tk.IntVar(value=3)
-        self.skip_scale = ttk.Scale(settings_frame, from_=1, to=30, orient=tk.HORIZONTAL, variable=self.skip_var, command=lambda v: self.skip_label.config(text=f"{int(float(v))}"))
-        self.skip_scale.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        self.skip_label = ttk.Label(settings_frame, text=f"{self.skip_var.get()}")
-        self.skip_label.grid(row=0, column=2, padx=5, pady=5)
+    def paintEvent(self, event):
+        """Draws all HUD elements onto the overlay."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing) # Smooth lines/text
 
+        # --- Draw Scanline ---
+        if self.flicker_on:
+            painter.setPen(QPen(RED_COLOR, 1, Qt.DashLine))
+            painter.drawLine(0, self.scanline_y, self.width(), self.scanline_y)
 
-        # YOLO resolution scale
-        ttk.Label(settings_frame, text="YOLO Scale:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-        self.yolo_scale_var = tk.DoubleVar(value=0.5) # Default to lower res
-        self.yolo_scale = ttk.Scale(settings_frame, from_=0.2, to=1.0, orient=tk.HORIZONTAL, variable=self.yolo_scale_var, command=lambda v: self.yolo_scale_label.config(text=f"{float(v):.1f}"))
-        self.yolo_scale.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
-        self.yolo_scale_label = ttk.Label(settings_frame, text=f"{self.yolo_scale_var.get():.1f}")
-        self.yolo_scale_label.grid(row=1, column=2, padx=5, pady=5)
+        # --- Draw Border ---
+        painter.setPen(QPen(RED_COLOR, 2))
+        painter.drawRect(10, 10, self.width() - 20, self.height() - 20) # Inset border
 
+        # --- Draw Text Info (Top Left) ---
+        painter.setFont(self.font_small)
+        painter.setPen(TEXT_COLOR)
+        text_x = 20
+        text_y = 30
+        line_height = 20
+        painter.drawText(text_x, text_y, f"SYS ID: {random_hex(8)}")
+        text_y += line_height
+        painter.drawText(text_x, text_y, f"TIME: {datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}") # Milliseconds
+        text_y += line_height
+        painter.drawText(text_x, text_y, f"PWR: {self.power_level:.1f}%")
+        text_y += line_height
+        painter.drawText(text_x, text_y, f"STATUS: {self.tracking_status}")
 
-        # --- Feature Toggles ---
-        features_frame = ttk.LabelFrame(controls_frame, text="Enable Features", padding="10")
-        features_frame.pack(fill=tk.X, pady=(0, 10))
+        # --- Draw Detection Boxes ---
+        painter.setFont(self.font_small)
+        for label, confidence, (x1, y1, x2, y2) in self.current_detections:
+            # Draw bounding box
+            painter.setPen(QPen(RED_COLOR, 1))
+            painter.drawRect(x1, y1, x2 - x1, y2 - y1)
+            # Draw label and confidence
+            painter.setPen(TEXT_COLOR)
+            painter.drawText(x1, y1 - 5, f"{label} {confidence:.1%}") # Text above box
 
-        self.yolo_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(features_frame, text="Object Detection", variable=self.yolo_enabled, command=self._toggle_widget_state).pack(anchor=tk.W, padx=5, pady=2)
+        # --- Draw Crosshair ---
+        painter.setPen(QPen(RED_COLOR, 2))
+        size = 25 # Size of the crosshair lines
+        x = int(self.crosshair_position.x())
+        y = int(self.crosshair_position.y())
+        # Draw horizontal and vertical lines centered at crosshair_position
+        painter.drawLine(x - size, y, x + size, y)
+        painter.drawLine(x, y - size, x, y + size)
+        # Optional: Draw a small circle/dot in the center
+        # painter.drawEllipse(QPointF(x, y), 3, 3)
 
-        self.optical_flow_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(features_frame, text="Optical Flow", variable=self.optical_flow_enabled).pack(anchor=tk.W, padx=5, pady=2)
+        painter.end() # End painting
 
-        self.depth_enabled = tk.BooleanVar(value=False)
-        ttk.Checkbutton(features_frame, text="Depth Estimation", variable=self.depth_enabled, command=self._toggle_widget_state).pack(anchor=tk.W, padx=5, pady=2)
+    def closeEvent(self, event):
+        """Clean up timers when the widget is closed."""
+        logger.info("Closing overlay widget...")
+        self.scanline_timer.stop()
+        self.hud_update_timer.stop()
+        self.crosshair_timer.stop()
+        super().closeEvent(event)
+
+# --- Main Control Window ---
+class MainWindow(QMainWindow):
+    """Provides controls for starting/stopping and configuring the overlay."""
+    # Signals to communicate settings changes to threads
+    detection_interval_changed = Signal(int)
+    confidence_threshold_changed = Signal(float)
+    nms_threshold_changed = Signal(float)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Terminator Vision Control Panel")
+        self.setGeometry(100, 100, 550, 600) # Position and size
+
+        # Apply basic styling
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #111111; /* Dark background */
+                color: #ff0000; /* Red text */
+            }
+            QWidget { /* Apply font to all child widgets */
+                font-family: 'Press Start 2P', Monospace;
+                font-size: 10pt; /* Slightly larger default font */
+            }
+            QLabel {
+                color: #ff0000;
+                padding-top: 5px; /* Add spacing above labels */
+            }
+            QComboBox, QSpinBox, QDoubleSpinBox {
+                background-color: #222222; /* Darker controls */
+                color: #ff0000;
+                border: 1px solid #ff0000;
+                padding: 3px;
+                border-radius: 3px; /* Slightly rounded corners */
+            }
+            QComboBox::drop-down {
+                border: 1px solid #ff0000;
+            }
+            QComboBox QAbstractItemView { /* Style dropdown list */
+                background-color: #222222;
+                color: #ff0000;
+                selection-background-color: #ff0000; /* Red selection */
+                selection-color: #000000; /* Black text on selection */
+            }
+            QPushButton {
+                background-color: #ff0000; /* Red button */
+                color: #000000; /* Black text */
+                border: none;
+                padding: 8px 12px; /* More padding */
+                margin-top: 10px; /* Space above buttons */
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #cc0000; /* Darker red on hover */
+            }
+            QPushButton:disabled {
+                background-color: #550000; /* Dark red when disabled */
+                color: #444444;
+            }
+            QTextEdit {
+                background-color: #000000; /* Black background */
+                color: #00ff00; /* Green log text */
+                border: 1px solid #ff0000;
+                font-family: Monospace; /* Use monospace for logs */
+                font-size: 9pt;
+                border-radius: 3px;
+            }
+        """)
+
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget) # Main vertical layout
+
+        # --- Configuration Section ---
+        config_layout = QGridLayout() # Use grid for alignment
+        self.main_layout.addLayout(config_layout)
+
+        # Monitor Selection
+        self.monitor_label = QLabel("Target Display:")
+        config_layout.addWidget(self.monitor_label, 0, 0)
+        self.monitor_combo = QComboBox()
+        config_layout.addWidget(self.monitor_combo, 0, 1)
+
+        # Model Selection
+        self.model_label = QLabel("Detection Model:")
+        config_layout.addWidget(self.model_label, 1, 0)
+        self.model_combo = QComboBox()
+        # Add various YOLOv8 models
+        self.model_combo.addItems(["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"])
+        self.model_combo.setCurrentText("yolov8n.pt") # Default to nano
+        config_layout.addWidget(self.model_combo, 1, 1)
+
+        # Detection Interval
+        self.detection_interval_label = QLabel("Detect Interval (ms):")
+        config_layout.addWidget(self.detection_interval_label, 2, 0)
+        self.detection_interval_spin = QSpinBox()
+        self.detection_interval_spin.setMinimum(20) # Min interval
+        self.detection_interval_spin.setMaximum(2000) # Max interval
+        self.detection_interval_spin.setSingleStep(10)
+        self.detection_interval_spin.setValue(DETECTION_INTERVAL_MS)
+        config_layout.addWidget(self.detection_interval_spin, 2, 1)
+
+        # Confidence Threshold
+        self.confidence_threshold_label = QLabel("Confidence Thresh:")
+        config_layout.addWidget(self.confidence_threshold_label, 3, 0)
+        self.confidence_threshold_spin = QDoubleSpinBox()
+        self.confidence_threshold_spin.setMinimum(0.05)
+        self.confidence_threshold_spin.setMaximum(0.95)
+        self.confidence_threshold_spin.setSingleStep(0.05)
+        self.confidence_threshold_spin.setDecimals(2)
+        self.confidence_threshold_spin.setValue(CONFIDENCE_THRESHOLD)
+        config_layout.addWidget(self.confidence_threshold_spin, 3, 1)
+
+        # NMS Threshold
+        self.nms_threshold_label = QLabel("NMS Thresh:")
+        config_layout.addWidget(self.nms_threshold_label, 4, 0)
+        self.nms_threshold_spin = QDoubleSpinBox()
+        self.nms_threshold_spin.setMinimum(0.1)
+        self.nms_threshold_spin.setMaximum(0.9)
+        self.nms_threshold_spin.setSingleStep(0.05)
+        self.nms_threshold_spin.setDecimals(2)
+        self.nms_threshold_spin.setValue(NMS_THRESHOLD)
+        config_layout.addWidget(self.nms_threshold_spin, 4, 1)
 
         # --- Control Buttons ---
-        button_frame = ttk.Frame(controls_frame, padding="5")
-        button_frame.pack(fill=tk.X, pady=(10, 0))
-        button_frame.columnconfigure(0, weight=1)
-        button_frame.columnconfigure(1, weight=1)
+        button_layout = QtWidgets.QHBoxLayout() # Horizontal layout for buttons
+        self.main_layout.addLayout(button_layout)
+        self.start_button = QPushButton("START VISION")
+        self.start_button.clicked.connect(self.start_overlay)
+        button_layout.addWidget(self.start_button)
+        self.stop_button = QPushButton("STOP VISION")
+        self.stop_button.clicked.connect(self.stop_overlay)
+        self.stop_button.setEnabled(False) # Disabled initially
+        button_layout.addWidget(self.stop_button)
 
-        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_processing)
-        self.start_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        # --- System Information Section ---
+        sys_info_layout = QGridLayout()
+        self.main_layout.addLayout(sys_info_layout)
 
-        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_processing, state=tk.DISABLED)
-        self.stop_button.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        sys_info_layout.addWidget(QLabel("--- System Status ---"), 0, 0, 1, 2, alignment=Qt.AlignCenter)
+
+        self.cpu_label = QLabel("CPU Usage:")
+        self.cpu_value = QLabel("N/A")
+        sys_info_layout.addWidget(self.cpu_label, 1, 0)
+        sys_info_layout.addWidget(self.cpu_value, 1, 1)
+
+        self.mem_label = QLabel("Memory Usage:")
+        self.mem_value = QLabel("N/A")
+        sys_info_layout.addWidget(self.mem_label, 2, 0)
+        sys_info_layout.addWidget(self.mem_value, 2, 1)
+
+        self.gpu_label = QLabel("GPU:")
+        self.gpu_value = QLabel("N/A")
+        sys_info_layout.addWidget(self.gpu_label, 3, 0)
+        sys_info_layout.addWidget(self.gpu_value, 3, 1)
+
+        self.gpu_mem_label = QLabel("GPU Memory:")
+        self.gpu_mem_value = QLabel("N/A")
+        sys_info_layout.addWidget(self.gpu_mem_label, 4, 0)
+        sys_info_layout.addWidget(self.gpu_mem_value, 4, 1)
+
+        self.screen_label = QLabel("Screen Res:")
+        self.screen_value = QLabel("N/A")
+        sys_info_layout.addWidget(self.screen_label, 5, 0)
+        sys_info_layout.addWidget(self.screen_value, 5, 1)
+
+        self.tracking_info_label = QLabel("Tracking:")
+        self.tracking_info_value = QLabel("INACTIVE")
+        sys_info_layout.addWidget(self.tracking_info_label, 6, 0)
+        sys_info_layout.addWidget(self.tracking_info_value, 6, 1)
 
         # --- Status Bar ---
-        status_frame = ttk.Frame(self.root, padding=(5, 2))
-        status_frame.pack(fill=tk.X, side=tk.BOTTOM)
+        self.status_label = QLabel("STATUS: Ready")
+        self.status_label.setStyleSheet("padding: 5px; border-top: 1px solid #ff0000;")
+        self.main_layout.addWidget(self.status_label)
 
-        self.status_label = ttk.Label(status_frame, text="Status: Idle")
-        self.status_label.pack(side=tk.LEFT)
+        # --- Log Output ---
+        self.log_label = QLabel("Log Output:")
+        self.main_layout.addWidget(self.log_label)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.main_layout.addWidget(self.log_text) # Add log display
 
-        self.fps_label = ttk.Label(status_frame, text="FPS: 0.0")
-        self.fps_label.pack(side=tk.RIGHT)
-
-        # Initial state update for widgets
-        self._toggle_widget_state()
-
-
-    def _toggle_widget_state(self):
-        """Enable/disable model/scale widgets based on checkboxes."""
-        # Object detection widgets
-        obj_state = tk.NORMAL if self.yolo_enabled.get() else tk.DISABLED
-        self.obj_model_dropdown.config(state=obj_state if obj_state == tk.NORMAL else "readonly")
-        self.yolo_scale.config(state=obj_state)
-
-        # Depth estimation widgets
-        depth_state = tk.NORMAL if self.depth_enabled.get() else tk.DISABLED
-        self.depth_model_dropdown.config(state=depth_state if depth_state == tk.NORMAL else "readonly")
-
-
-    def start_processing(self):
-        """Initialize models and start the processing loop."""
-        if self.is_running:
-            return
-
-        # --- Set Device ---
-        if self.available_gpus:
-            selected_gpu = self.gpu_var.get()
-            try:
-                gpu_index = int(selected_gpu.split(":")[0].split()[1])
-                self.device = torch.device(f"cuda:{gpu_index}")
-                status_msg = f"Using {selected_gpu}"
-            except (IndexError, ValueError) as e:
-                 messagebox.showerror("GPU Error", f"Invalid GPU selection: {selected_gpu}. Error: {e}")
-                 return
-        else:
-            self.device = torch.device("cpu")
-            status_msg = "Using CPU"
-        self.status_label.config(text=f"Status: Initializing models on {self.device}...")
-        self.root.update_idletasks() # Force GUI update
-
-        # --- Disable Controls ---
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-        self._set_controls_state(tk.DISABLED)
-
-        # --- Load Models ---
-        if not self.initialize_models():
-            self.stop_processing() # Re-enable controls if loading fails
-            return # Stop if models failed to load
-
-        # --- Setup Processing Variables ---
-        self.setup_variables()
-
-        # --- Start Loop ---
-        self.is_running = True
-        self.status_label.config(text=f"Status: Running ({status_msg})")
-        self.video_label.config(text="")  # Clear placeholder text
-        self.update()  # Start the processing loop
-
-    def stop_processing(self):
-        """Stops the processing loop."""
-        if not self.is_running:
-            return
-
-        self.is_running = False
-        if self.update_id:
-            self.root.after_cancel(self.update_id)
-            self.update_id = None
-
-        # --- Re-enable Controls ---
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        self._set_controls_state(tk.NORMAL)
-        self._toggle_widget_state() # Re-apply enable/disable based on checkboxes
-
-        # --- Clear State ---
-        self.prev_frame_gray_cpu = None
-        self.prev_frame_gray_gpu = None # Release GPU memory if allocated
-        self.last_detections = None
-        self.last_depth_colormap = None
-        self.video_label.config(image='') # Clear image
-        self.video_label.config(text="Select settings and click Start")
-        self.status_label.config(text="Status: Idle")
-        self.fps_label.config(text="FPS: 0.0")
-        print("Processing stopped.")
-
-
-    def _set_controls_state(self, state):
-        """Enable or disable all control widgets."""
-        widgets_to_toggle = [
-            self.gpu_dropdown, self.obj_model_dropdown, self.depth_model_dropdown,
-            self.skip_scale, self.yolo_scale
-        ]
-        # Also toggle checkboxes
-        for child in self.root.winfo_children():
-             if isinstance(child, ttk.Frame): # Look in frames
-                 for sub_child in child.winfo_children():
-                     if isinstance(sub_child, ttk.LabelFrame):
-                         for widget in sub_child.winfo_children():
-                              if isinstance(widget, (ttk.Combobox, ttk.Scale, ttk.Checkbutton)):
-                                   try:
-                                       widget.config(state=state)
-                                   except tk.TclError: # Handle widgets that don't have state (like Labels)
-                                       pass
-                     elif isinstance(sub_child, (ttk.Combobox, ttk.Scale, ttk.Checkbutton)):
-                          try:
-                              sub_child.config(state=state)
-                          except tk.TclError:
-                              pass
-
-        # Special handling for combobox readonly state if disabling
-        if state == tk.DISABLED:
-            self.obj_model_dropdown.config(state="disabled")
-            self.depth_model_dropdown.config(state="disabled")
-            if self.available_gpus:
-                self.gpu_dropdown.config(state="disabled")
-        else: # Re-enable based on checkboxes
-             self._toggle_widget_state()
-             if self.available_gpus:
-                 self.gpu_dropdown.config(state="readonly")
-
-
-    def initialize_models(self):
-        """
-        Loads object detection and depth estimation models onto the selected device.
-
-        Returns:
-            bool: True if models loaded successfully, False otherwise.
-        """
-        success = True
+        # --- Populate Monitors ---
         try:
-            # --- Object Detection Model ---
-            if self.yolo_enabled.get():
-                obj_model_name = self.obj_model_var.get()
-                print(f"Loading object detection model: {obj_model_name}...")
-                # Ensure cache directory exists or handle potential issues
-                torch.hub.set_dir(torch.hub.get_dir()) # Use default cache dir
-                if "yolov5" in obj_model_name:
-                    self.yolo_model = torch.hub.load('ultralytics/yolov5', obj_model_name, pretrained=True, trust_repo=True)
-                elif "yolov8" in obj_model_name:
-                     # Yolov8 loading might differ, adjust if needed based on ultralytics library
-                     # This assumes a similar torch.hub interface or requires ultralytics pip package
-                     from ultralytics import YOLO # Requires `pip install ultralytics`
-                     self.yolo_model = YOLO(f'{obj_model_name}.pt') # Load weights file
-                     # Note: YOLOv8 might return results differently than YOLOv5
-                     # The 'from_yolov5' function in supervision might need adjustment or replacement
-                     # For simplicity, we'll assume a compatible results object for now.
-                     # If errors occur in process_frame, this is a likely cause.
+            with mss.mss() as sct:
+                # Filter out the 'all monitors' option if present
+                self.monitors = [m for m in sct.monitors if m.get('width') and m.get('height')]
+                if not self.monitors:
+                     raise ValueError("No usable monitors found by mss.")
+                # Remove the primary 'all' monitor entry if it exists (often index 0)
+                if self.monitors[0]['left'] == 0 and self.monitors[0]['top'] == 0:
+                    primary_width = pyautogui.size().width
+                    primary_height = pyautogui.size().height
+                    # Check if the first monitor matches the primary screen size exactly
+                    if self.monitors[0]['width'] >= primary_width and self.monitors[0]['height'] >= primary_height:
+                         # Heuristic: If the first monitor covers the primary, assume it's the 'all' monitor
+                         logger.info("Excluding potential 'all monitors' entry from mss list.")
+                         self.monitors = self.monitors[1:]
 
-                else:
-                    raise ValueError(f"Unsupported object detection model: {obj_model_name}")
 
-                self.yolo_model.to(self.device) # Move model to device
-                if hasattr(self.yolo_model, 'conf'): # yolov5 style
-                     self.yolo_model.conf = 0.4
-                if hasattr(self.yolo_model, 'eval'): # Common PyTorch method
-                    self.yolo_model.eval()
-                print("Object detection model loaded.")
-            else:
-                self.yolo_model = None # Ensure it's None if not enabled
+            if not self.monitors:
+                raise ValueError("No individual monitors found after filtering.")
 
-            # --- Depth Estimation Model ---
-            if self.depth_enabled.get():
-                depth_model_name = self.depth_model_var.get()
-                print(f"Loading depth estimation model: {depth_model_name}...")
-                # Ensure cache directory exists
-                torch.hub.set_dir(torch.hub.get_dir())
-                self.depth_model = torch.hub.load("intel-isl/MiDaS", depth_model_name, trust_repo=True)
-                self.depth_model.to(self.device)
-                self.depth_model.eval()
-                # Load appropriate transform based on model type
-                transform_name = 'transforms'
-                if "DPT" in depth_model_name:
-                    self.depth_transform = torch.hub.load("intel-isl/MiDaS", f"{transform_name}.dpt_transform", trust_repo=True)
-                elif "MiDaS_small" in depth_model_name:
-                     self.depth_transform = torch.hub.load("intel-isl/MiDaS", f"{transform_name}.small_transform", trust_repo=True)
-                else: # Generic MiDaS transform as fallback
-                    self.depth_transform = torch.hub.load("intel-isl/MiDaS", f"{transform_name}.midas_transform", trust_repo=True)
-
-                print("Depth estimation model loaded.")
-            else:
-                self.depth_model = None # Ensure it's None if not enabled
-                self.depth_transform = None
+            for i, monitor in enumerate(self.monitors):
+                label = f"Display {i+1}: {monitor['width']}x{monitor['height']} @ ({monitor['left']},{monitor['top']})"
+                self.monitor_combo.addItem(label, userData=monitor) # Store monitor dict as userData
+            logger.info(f"Found {len(self.monitors)} monitor(s).")
+            self.monitor_combo.setCurrentIndex(0) # Select first monitor by default
 
         except Exception as e:
-            error_msg = f"Failed to load models: {str(e)}\n\n{traceback.format_exc()}"
-            messagebox.showerror("Model Loading Error", error_msg)
-            print(error_msg)
-            # Clean up partially loaded models
-            self.yolo_model = None
-            self.depth_model = None
-            self.depth_transform = None
-            success = False
+            error_msg = f"Error initializing monitors: {e}"
+            logger.error(error_msg, exc_info=True)
+            self.status_label.setText(error_msg)
+            self.start_button.setEnabled(False)
+            self.monitor_combo.addItem("Error: No monitors detected")
 
-        return success
+        # --- Connect Signals ---
+        self.detection_interval_spin.valueChanged.connect(self.on_detection_interval_changed)
+        self.confidence_threshold_spin.valueChanged.connect(self.on_confidence_threshold_changed)
+        self.nms_threshold_spin.valueChanged.connect(self.on_nms_threshold_changed)
 
+        # --- System Info Timer ---
+        self.sys_info_timer = QTimer(self)
+        self.sys_info_timer.timeout.connect(self.update_system_info)
+        self.sys_info_timer.start(SYSTEM_INFO_INTERVAL_MS)
+        self.update_system_info() # Initial update
 
-    def setup_variables(self):
-        """Initialize or reset processing variables before starting."""
-        self.prev_frame_gray_cpu = None
-        self.prev_frame_gray_gpu = None
-        self.fps_last_time = time.time()
-        self.fps_counter = 0
-        # Re-initialize HSV matrix based on current monitor dimensions if needed
-        self.optical_flow_hsv = np.zeros((self.monitor["height"], self.monitor["width"], 3), dtype=np.uint8)
-        self.optical_flow_hsv[..., 1] = 255 # Set saturation to max
-        self.frame_count = 0
-        self.last_detections = None
-        self.last_depth_colormap = None
+        # --- Initialize Threads and Overlay ---
+        self.capture_thread = None
+        self.detection_thread = None
+        self.overlay = None
 
-        # Initialize GPU-based optical flow if CUDA is available and enabled
-        if self.optical_flow_enabled.get() and self.cuda_available:
-            try:
-                self.prev_frame_gray_gpu = cv2.cuda_GpuMat()
-                # Parameters for Farneback can be tuned
-                self.gpu_flow_calculator = cv2.cuda_FarnebackOpticalFlow.create(
-                    numLevels=5, pyrScale=0.5, fastPyramids=False, winSize=13,
-                    numIters=10, polyN=5, polySigma=1.1, flags=0
-                )
-                print("Using GPU for Optical Flow.")
-            except cv2.error as e:
-                 print(f"Warning: Could not initialize CUDA Optical Flow ({e}). Falling back to CPU.")
-                 self.cuda_available = False # Disable CUDA flow for this session
-                 self.gpu_flow_calculator = None
-                 self.prev_frame_gray_gpu = None
-        else:
-            self.gpu_flow_calculator = None
-            self.prev_frame_gray_gpu = None
-            if self.optical_flow_enabled.get():
-                 print("Using CPU for Optical Flow.")
+        logger.info("Main window initialized.")
 
+    # --- Slot Methods for Settings Changes ---
+    @Slot(int)
+    def on_detection_interval_changed(self, value):
+        self.detection_interval_changed.emit(value)
+        logger.debug(f"GUI emitted detection_interval_changed: {value}")
 
-    def update(self):
-        """Main loop to capture and process frames."""
-        if not self.is_running:
+    @Slot(float)
+    def on_confidence_threshold_changed(self, value):
+        self.confidence_threshold_changed.emit(value)
+        logger.debug(f"GUI emitted confidence_threshold_changed: {value:.2f}")
+
+    @Slot(float)
+    def on_nms_threshold_changed(self, value):
+        self.nms_threshold_changed.emit(value)
+        logger.debug(f"GUI emitted nms_threshold_changed: {value:.2f}")
+
+    # --- Start/Stop Methods ---
+    def start_overlay(self):
+        """Starts the screen capture, detection, and overlay."""
+        monitor_data = self.monitor_combo.currentData()
+        if not monitor_data:
+            self.update_status("ERROR: Please select a valid monitor.")
+            logger.error("Start attempt failed: No monitor selected.")
             return
 
-        start_frame_time = time.time()
-        processed_frame = None # Initialize
+        monitor_spec = monitor_data
+        model_name = self.model_combo.currentText()
+        logger.info(f"Starting overlay on monitor: {monitor_spec} with model: {model_name}")
+        self.update_status(f"Initializing ({model_name})...")
+
+        # --- Create Threads and Overlay ---
         try:
-            # --- Capture Frame ---
-            frame_bgr = np.array(self.sct.grab(self.monitor))[:, :, :3] # Grab BGR
-            if frame_bgr.size == 0:
-                print("Warning: Captured empty frame.")
-                # Schedule next update and skip processing this frame
-                self.update_id = self.root.after(10, self.update) # Wait a bit longer
-                return
-
-            # Ensure contiguous array for OpenCV compatibility
-            frame_bgr = np.ascontiguousarray(frame_bgr)
-
-            # --- Process Frame ---
-            processed_frame = self.process_frame(frame_bgr)
-
-            # --- Display Frame ---
-            # Convert final processed frame (BGR) to RGB for PIL/Tkinter
-            img_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-            img_pil = Image.fromarray(img_rgb)
-
-            # Resize image to fit the label while maintaining aspect ratio (optional but recommended)
-            label_w = self.video_label.winfo_width()
-            label_h = self.video_label.winfo_height()
-            if label_w > 1 and label_h > 1: # Check if widget size is available
-                img_pil.thumbnail((label_w, label_h), Image.Resampling.LANCZOS)
-
-            img_tk = ImageTk.PhotoImage(image=img_pil)
-
-            # Update label
-            self.video_label.img = img_tk  # Keep reference to avoid garbage collection
-            self.video_label.configure(image=img_tk)
-
-        except mss.ScreenShotError as e:
-             print(f"Screen capture error: {e}")
-             # Potentially stop processing or try to re-initialize sct
-             self.stop_processing()
-             messagebox.showerror("Capture Error", "Screen capture failed. Stopping.")
-             return
+            self.capture_thread = ScreenCaptureThread(monitor_spec)
+            self.detection_thread = DetectionThread(model_name)
+            self.overlay = TerminatorOverlay(monitor_spec) # Create overlay instance
         except Exception as e:
-            print(f"Error during frame processing or display: {e}")
-            traceback.print_exc()
-            # Optionally stop processing on error, or just log and continue
-            # self.stop_processing()
-            # return
+            error_msg = f"Failed to create threads/overlay: {e}"
+            logger.error(error_msg, exc_info=True)
+            self.update_status(f"ERROR: {error_msg}")
+            self.stop_overlay() # Clean up any partial setup
+            return
 
-        # --- Update FPS ---
-        self.fps_counter += 1
-        current_time = time.time()
-        elapsed_time = current_time - self.fps_last_time
-        if elapsed_time >= 1.0:
-            fps = self.fps_counter / elapsed_time
-            self.fps_label.config(text=f"FPS: {fps:.1f}")
-            self.fps_last_time = current_time
-            self.fps_counter = 0
+        # --- Connect Signals between Components ---
+        # Capture -> Detection
+        self.capture_thread.frame_ready.connect(self.detection_thread.set_frame)
+        # Detection -> Overlay
+        self.detection_thread.detections_ready.connect(self.overlay.update_detections)
+        # Detection -> Main Window (for tracking status)
+        self.detection_thread.detections_ready.connect(self.update_tracking_info)
+        # Status Updates -> Main Window
+        self.detection_thread.status_update.connect(self.update_status)
+        self.capture_thread.status_update.connect(self.update_status)
+        # Settings -> Threads
+        self.detection_interval_changed.connect(self.capture_thread.update_detection_interval)
+        self.confidence_threshold_changed.connect(self.detection_thread.update_confidence_threshold)
+        self.nms_threshold_changed.connect(self.detection_thread.update_nms_threshold)
 
-        # --- Schedule Next Update ---
-        # Calculate delay for roughly 60fps target, considering processing time
-        # processing_time_ms = int((time.time() - start_frame_time) * 1000)
-        # delay = max(1, 16 - processing_time_ms) # Target ~60 FPS (16ms per frame)
-        delay = 1 # Run as fast as possible
-        self.update_id = self.root.after(delay, self.update)
+        # --- Emit Initial Settings ---
+        # Ensure threads get the current values *before* starting
+        self.on_detection_interval_changed(self.detection_interval_spin.value())
+        self.on_confidence_threshold_changed(self.confidence_threshold_spin.value())
+        self.on_nms_threshold_changed(self.nms_threshold_spin.value())
 
+        # --- Start Threads ---
+        # Start detection first (it needs to load the model)
+        self.detection_thread.start()
+        # Give detection thread a moment to start loading model before capture begins
+        QTimer.singleShot(500, self.capture_thread.start)
 
-    def process_frame(self, frame_bgr):
-        """
-        Processes a single frame using enabled techniques.
+        # --- Show Overlay ---
+        self.overlay.show()
 
-        Args:
-            frame_bgr (np.ndarray): The input frame in BGR format.
+        # --- Update GUI State ---
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.monitor_combo.setEnabled(False) # Prevent changing monitor while running
+        self.model_combo.setEnabled(False)   # Prevent changing model while running
+        self.update_status("Overlay starting...")
+        logger.info("Overlay components started.")
 
-        Returns:
-            np.ndarray: The processed frame in BGR format.
-        """
-        self.frame_count += 1
-        processed_frame = frame_bgr.copy() # Work on a copy
-        skip_frames = self.skip_var.get()
-        yolo_scale = self.yolo_scale_var.get()
-        perform_expensive_ops = (self.frame_count % skip_frames == 0)
+    def stop_overlay(self):
+        """Stops the threads and hides the overlay."""
+        logger.info("Stopping overlay components...")
+        self.update_status("Stopping...")
 
-        # --- Object Detection ---
-        if self.yolo_enabled.get() and self.yolo_model:
-            if perform_expensive_ops:
-                # Prepare frame for YOLO (RGB, potential resize)
-                if yolo_scale < 1.0:
-                    proc_height = int(self.monitor["height"] * yolo_scale)
-                    proc_width = int(self.monitor["width"] * yolo_scale)
-                    yolo_input_frame = cv2.resize(frame_bgr, (proc_width, proc_height), interpolation=cv2.INTER_LINEAR)
-                else:
-                    yolo_input_frame = frame_bgr
-                yolo_input_frame_rgb = cv2.cvtColor(yolo_input_frame, cv2.COLOR_BGR2RGB)
+        # Stop threads safely
+        if hasattr(self, 'capture_thread') and self.capture_thread and self.capture_thread.isRunning():
+            self.capture_thread.stop()
+            if not self.capture_thread.wait(1500): # Wait 1.5 sec
+                 logger.warning("Capture thread did not stop gracefully.")
+                 self.capture_thread.terminate() # Force terminate if needed
 
-                # Inference
-                with torch.no_grad():
-                    # Use AMP for potential speedup on compatible GPUs
-                    with torch.amp.autocast(device_type=self.device.type, enabled=self.device.type=='cuda'):
-                        results = self.yolo_model(yolo_input_frame_rgb) # Pass RGB frame
+        if hasattr(self, 'detection_thread') and self.detection_thread and self.detection_thread.isRunning():
+            self.detection_thread.stop()
+            if not self.detection_thread.wait(2500): # Wait 2.5 sec
+                logger.warning("Detection thread did not stop gracefully.")
+                self.detection_thread.terminate() # Force terminate
 
-                # Process results (assuming supervision `from_yolov5` or similar works for yolov8)
-                try:
-                    # This part might need adjustment based on the exact format of YOLOv8 results
-                    if isinstance(self.yolo_model, torch.nn.Module): # Heuristic for yolov5
-                         detections = sv.Detections.from_yolov5(results)
-                    else: # Assume ultralytics YOLO object for yolov8
-                         # Need to adapt this based on ultralytics result object structure
-                         # Example: results[0].boxes.xyxy, results[0].boxes.conf, results[0].boxes.cls
-                         # This is a placeholder - requires checking ultralytics documentation
-                         boxes = results[0].boxes.xyxy.cpu().numpy()
-                         conf = results[0].boxes.conf.cpu().numpy()
-                         cls = results[0].boxes.cls.cpu().numpy().astype(int)
-                         detections = sv.Detections(xyxy=boxes, confidence=conf, class_id=cls)
+        # Close overlay window
+        if hasattr(self, 'overlay') and self.overlay:
+            self.overlay.close() # Use close() to trigger closeEvent
 
+        # Clean up references
+        self.capture_thread = None
+        self.detection_thread = None
+        self.overlay = None
 
-                    # Scale detections back if resized
-                    if yolo_scale < 1.0:
-                        scale_x = self.monitor["width"] / proc_width
-                        scale_y = self.monitor["height"] / proc_height
-                        detections.xyxy[:, [0, 2]] *= scale_x
-                        detections.xyxy[:, [1, 3]] *= scale_y
-                    self.last_detections = detections
-                except Exception as e:
-                    print(f"Error processing YOLO results: {e}") # Log error but continue
-                    self.last_detections = None # Reset detections on error
+        # --- Update GUI State ---
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.monitor_combo.setEnabled(True) # Re-enable controls
+        self.model_combo.setEnabled(True)
+        self.update_status("STATUS: Stopped")
+        self.tracking_info_value.setText("INACTIVE")
+        logger.info("Overlay components stopped.")
 
-            # Annotate frame with the latest valid detections
-            if self.last_detections is not None and len(self.last_detections) > 0:
-                # Customize annotators if needed
-                box_annotator = sv.BoxAnnotator(thickness=1, text_thickness=1, text_scale=0.4)
-                label_annotator = sv.LabelAnnotator(text_position=sv.Position.TOP_CENTER, text_scale=0.4, text_thickness=1)
+    # --- Slot for Status Updates ---
+    @Slot(str)
+    def update_status(self, message):
+        """Updates the status label and logs the message."""
+        # Prepend "STATUS: " if not already present for clarity
+        display_message = message if message.lower().startswith("status:") else f"STATUS: {message}"
+        self.status_label.setText(display_message)
+        # Avoid logging redundant status updates if they come frequently
+        # logger.info(message) # Optionally log every status update
 
-                labels = [
-                    f"{self.yolo_model.names[class_id]} {confidence:.2f}"
-                    for _, _, confidence, class_id, _
-                    in self.last_detections
-                ]
-                processed_frame = box_annotator.annotate(scene=processed_frame, detections=self.last_detections)
-                processed_frame = label_annotator.annotate(scene=processed_frame, detections=self.last_detections, labels=labels)
+    @Slot(list)
+    def update_tracking_info(self, detections):
+        """Updates the tracking info label based on detections."""
+        if self.overlay and self.overlay.isVisible(): # Only update if overlay is active
+            self.tracking_info_value.setText(self.overlay.tracking_status)
+        else:
+            self.tracking_info_value.setText("INACTIVE")
 
+    # --- System Info Update Method ---
+    def update_system_info(self):
+        """Fetches and displays system information."""
+        try:
+            # CPU Usage
+            cpu_percent = psutil.cpu_percent()
+            self.cpu_value.setText(f"{cpu_percent:.1f}%")
 
-        # --- Optical Flow ---
-        if self.optical_flow_enabled.get():
-            # Convert current frame to grayscale
-            gray_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            # Memory Usage
+            mem = psutil.virtual_memory()
+            mem_percent = mem.percent
+            mem_gb = f"{(mem.used / (1024**3)):.1f} / {(mem.total / (1024**3)):.1f} GB"
+            self.mem_value.setText(f"{mem_percent:.1f}% ({mem_gb})")
 
-            flow = None
-            if self.cuda_available and self.gpu_flow_calculator and self.prev_frame_gray_gpu:
-                # --- GPU Optical Flow ---
-                gpu_current_gray = cv2.cuda_GpuMat()
-                gpu_current_gray.upload(gray_bgr)
+            # GPU Info (if available)
+            gpu_name, gpu_mem = get_gpu_info()
+            self.gpu_value.setText(gpu_name)
+            self.gpu_mem_value.setText(gpu_mem)
 
-                if not self.prev_frame_gray_gpu.empty():
-                    gpu_flow_field = self.gpu_flow_calculator.calc(self.prev_frame_gray_gpu, gpu_current_gray, None)
-                    flow = gpu_flow_field.download() # Download result back to CPU
+            # Screen Resolution (Primary Monitor)
+            try:
+                screen_width, screen_height = pyautogui.size()
+                self.screen_value.setText(f"{screen_width} x {screen_height}")
+            except Exception as e:
+                logger.warning(f"Could not get screen size via pyautogui: {e}")
+                self.screen_value.setText("N/A")
 
-                # Update previous frame on GPU for next iteration
-                self.prev_frame_gray_gpu.upload(gray_bgr) # More efficient than reassigning
-
-            elif self.prev_frame_gray_cpu is not None:
-                # --- CPU Optical Flow ---
-                flow = cv2.calcOpticalFlowFarneback(self.prev_frame_gray_cpu, gray_bgr, None,
-                                                    pyr_scale=0.5, levels=3, winsize=15,
-                                                    iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
-
-            # If flow was calculated, visualize it
-            if flow is not None:
-                mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-                self.optical_flow_hsv[..., 0] = ang * 180 / np.pi / 2 # Hue from angle
-                # self.optical_flow_hsv[..., 1] = 255 # Saturation (already set)
-                self.optical_flow_hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX) # Value from magnitude
-                flow_rgb = cv2.cvtColor(self.optical_flow_hsv, cv2.COLOR_HSV2BGR)
-                # Blend flow visualization with the processed frame
-                processed_frame = cv2.addWeighted(processed_frame, 0.7, flow_rgb, 0.3, 0)
-
-            # Store current grayscale frame for next iteration (CPU)
-            self.prev_frame_gray_cpu = gray_bgr
+        except Exception as e:
+            logger.error(f"Error updating system info: {e}", exc_info=True)
+            # Optionally clear fields or show error indication
+            self.cpu_value.setText("Error")
+            self.mem_value.setText("Error")
+            # Keep GPU/Screen as they might be fetched differently
 
 
-        # --- Depth Estimation ---
-        if self.depth_enabled.get() and self.depth_model and self.depth_transform:
-            if perform_expensive_ops:
-                # Prepare frame for MiDaS (RGB)
-                depth_input_frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                # Transform and move to device
-                input_batch = self.depth_transform(depth_input_frame_rgb).to(self.device)
+    # --- Cleanup on Close ---
+    def closeEvent(self, event):
+        """Ensures threads are stopped when the main window is closed."""
+        logger.info("Main window closing. Stopping overlay...")
+        self.stop_overlay() # Call the stop function
+        self.sys_info_timer.stop() # Stop the system info timer
+        super().closeEvent(event) # Proceed with closing
 
-                with torch.no_grad():
-                    with torch.amp.autocast(device_type=self.device.type, enabled=self.device.type=='cuda'):
-                        prediction = self.depth_model(input_batch)
-
-                    # Resize prediction to original frame size
-                    prediction = torch.nn.functional.interpolate(
-                        prediction.unsqueeze(1),
-                        size=(self.monitor["height"], self.monitor["width"]),
-                        mode="bicubic", # Use bicubic for smoother results
-                        align_corners=False,
-                    ).squeeze()
-
-                # Process depth map (normalize, convert to uint8, apply colormap)
-                depth_map = prediction.cpu().numpy()
-                depth_map_normalized = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX) # Normalize to 0-1 range
-                depth_map_uint8 = (depth_map_normalized * 255).astype(np.uint8)
-                self.last_depth_colormap = cv2.applyColorMap(depth_map_uint8, cv2.COLORMAP_MAGMA) # Or COLORMAP_JET, etc.
-
-            # Blend depth map with the processed frame using the latest colormap
-            if self.last_depth_colormap is not None:
-                processed_frame = cv2.addWeighted(processed_frame, 0.6, self.last_depth_colormap, 0.4, 0)
-
-        return processed_frame
-
-
-    def on_close(self):
-        """Clean up resources on window close."""
-        print("Closing application...")
-        self.stop_processing() # Ensure the loop is stopped
-        if self.sct:
-            self.sct.close() # Close mss context
-            print("Screen capture closed.")
-        # No explicit cv2.destroyAllWindows() needed as Tkinter manages the window
-        self.root.destroy()
-        print("Application closed.")
-        # Ensure script exits cleanly, especially if threads were involved (though not in this version)
-        sys.exit(0)
-
-
+# --- Main Execution ---
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = VisionSimulator(root)
-    root.mainloop()
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, # Set base level
+                        format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
+                        handlers=[logging.StreamHandler()]) # Log to console by default
+
+    logger = logging.getLogger() # Get root logger
+
+    # --- Application Setup ---
+    app = QApplication(sys.argv)
+
+    # --- Font Loading ---
+    font_path = os.path.join(os.path.dirname(__file__), "PressStart2P-Regular.ttf") # Assuming font file is nearby
+    if os.path.exists(font_path):
+        font_id = QFontDatabase.addApplicationFont(font_path)
+        if font_id != -1:
+            families = QFontDatabase.applicationFontFamilies(font_id)
+            if families:
+                logger.info(f"Successfully loaded font: {families[0]}")
+            else:
+                logger.warning(f"Loaded font file '{font_path}' but no families found.")
+        else:
+            logger.error(f"Failed to load font file: {font_path}")
+    else:
+        # Check if font is installed system-wide
+        font_db = QFontDatabase()
+        if FONT_NAME not in font_db.families():
+             logger.warning(f"Font file '{font_path}' not found and '{FONT_NAME}' not installed system-wide. Will use fallback.")
+
+
+    # --- Create and Show Main Window ---
+    main_window = MainWindow()
+
+    # Add the QTextEdit logger handler
+    log_handler = QTextEditLogger(main_window.log_text)
+    logger.addHandler(log_handler)
+
+    main_window.show()
+
+    # Ensure stop_overlay is called when application quits
+    app.aboutToQuit.connect(main_window.stop_overlay)
+
+    # --- Run Application ---
+    try:
+        exit_code = app.exec()
+        logger.info(f"Application finished with exit code {exit_code}.")
+        sys.exit(exit_code)
+    except Exception as e:
+        logger.critical(f"Unhandled application error: {e}", exc_info=True)
+        sys.exit(1) # Exit with error code
